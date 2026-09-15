@@ -12,7 +12,7 @@ const MAX_NAME: usize = 256;
 
 /// Application-owned pins with explicit compare-and-replace trust migration.
 ///
-/// A successful connection or signature does not mutate this
+/// A successful connection, discovery record, or signature does not mutate this
 /// store. The application must approve a replacement ID through an appropriate
 /// trusted channel before calling [`Self::migrate`]. Permissions are application
 /// state and are not copied by a migration.

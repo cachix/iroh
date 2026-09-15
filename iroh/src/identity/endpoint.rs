@@ -32,6 +32,8 @@ const DIAL_RELAY_FAILURES: u32 = 24;
 const MAX_HANDSHAKES: usize = 1024;
 /// Authenticated connections waiting for [`IdentityEndpoint::accept`].
 const ACCEPT_QUEUE: usize = 256;
+/// Identities whose latest discovery record is remembered for rollback checks.
+const MAX_DISCOVERED: usize = 4096;
 
 /// The exact identity and routing hints used to connect.
 ///
@@ -40,7 +42,7 @@ const ACCEPT_QUEUE: usize = 256;
 pub struct EndpointAddr {
     /// The identity that must authenticate the connection.
     pub id: PeerId,
-    /// A direct destination, or an unspecified address with port zero for relay routing.
+    /// A direct destination, or an unspecified address with port zero for relay/discovery.
     pub addr: SocketAddr,
     /// Additional direct addresses and versioned relay locations.
     pub addrs: BTreeSet<TransportAddr>,
@@ -91,6 +93,7 @@ pub struct Builder {
     registry: Arc<Registry>,
     settings: Settings,
     policy: Option<RemotePolicy>,
+    lookup: Option<Arc<dyn super::AddressLookup>>,
 }
 
 impl Builder {
@@ -104,7 +107,14 @@ impl Builder {
             registry,
             settings,
             policy: None,
+            lookup: None,
         }
+    }
+
+    /// Configure signed discovery for typed identities.
+    pub fn address_lookup(mut self, lookup: Arc<dyn super::AddressLookup>) -> Self {
+        self.lookup = Some(lookup);
+        self
     }
 
     /// Select a single local binding, replacing prior IP bindings.
@@ -171,7 +181,7 @@ impl Builder {
         self
     }
 
-    /// Configure TLS trust for relay HTTPS connections.
+    /// Configure TLS trust for relay and discovery HTTPS connections.
     pub fn ca_tls_config(mut self, config: crate::tls::CaTlsConfig) -> Self {
         self.settings.ca_tls = config;
         self
@@ -332,6 +342,8 @@ impl Builder {
             keylog: self.settings.keylog,
             configured_addrs: self.settings.configured_addrs,
             candidates,
+            lookup: self.lookup,
+            discovered: Default::default(),
             https,
             dial_relays,
             accepted: tokio::sync::Mutex::new(accepted_rx),
@@ -460,11 +472,26 @@ fn spawn_relay(session: RelaySession) {
     }));
 }
 
+fn unix_seconds() -> Result<u64, Error> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|v| v.as_secs())
+        .map_err(|_| Error::Protocol("clock before Unix epoch"))
+}
+
 fn check_alpn(alpn: &[u8]) -> Result<(), Error> {
     if alpn.is_empty() || alpn.len() > 255 {
         return Err(Error::Alpn);
     }
     Ok(())
+}
+
+/// The last verified discovery record seen for a peer, kept for rollback checks.
+#[derive(Debug)]
+struct Discovered {
+    sequence: u64,
+    expires: u64,
+    digest: blake3::Hash,
 }
 
 /// An authenticated connection before it is handed to the application.
@@ -488,6 +515,8 @@ struct Inner {
     keylog: bool,
     configured_addrs: BTreeSet<SocketAddr>,
     candidates: tokio::sync::watch::Sender<BTreeSet<SocketAddr>>,
+    lookup: Option<Arc<dyn super::AddressLookup>>,
+    discovered: std::sync::Mutex<HashMap<PeerId, Discovered>>,
     https: Arc<rustls::ClientConfig>,
     dial_relays: Arc<tokio::sync::Mutex<HashMap<RelayUrl, DialRelay>>>,
     accepted: tokio::sync::Mutex<mpsc::Receiver<Result<Accepted, Error>>>,
@@ -640,7 +669,7 @@ impl IdentityEndpoint {
 
     /// Authenticate exactly the requested identity over IP or a versioned relay.
     ///
-    /// Supply direct addresses or a relay location in the destination. Compatible
+    /// An identity without locations uses configured signed discovery. Compatible
     /// direct addresses race alongside relay registration and the relayed handshake.
     /// Authenticated NAT traversal can establish a direct path after a relay connects.
     /// Does not retry with a legacy identity. Early data and resumption are disabled.
@@ -650,9 +679,17 @@ impl IdentityEndpoint {
         alpn: &[u8],
     ) -> Result<Connection, Error> {
         check_alpn(alpn)?;
-        let address = address.into();
+        let mut address = address.into();
         if address.id == self.id() {
             return Err(Error::SelfConnect);
+        }
+        if address.addr.port() == 0 && address.addrs.is_empty() {
+            let lookup = self.0.lookup.as_ref().ok_or(Error::Destination)?;
+            let bytes = lookup.resolve(address.id).await?;
+            let now = unix_seconds()?;
+            let contact = super::SignedContact::verify(&bytes, address.id, &self.0.registry, now)?;
+            self.remember_discovered(address.id, &contact, &bytes, now)?;
+            address.addrs = contact.addresses().clone();
         }
         let local = self.0.routing.local_addrs();
         let direct: BTreeSet<_> = std::iter::once(address.addr)
@@ -732,6 +769,42 @@ impl IdentityEndpoint {
         Err(last_error)
     }
 
+    /// Reject records older than the newest one seen for this identity.
+    ///
+    /// Only a digest of each record is retained, and expired entries are
+    /// evicted under pressure, so long-lived endpoints stay bounded.
+    fn remember_discovered(
+        &self,
+        peer: PeerId,
+        contact: &super::SignedContact,
+        bytes: &[u8],
+        now: u64,
+    ) -> Result<(), Error> {
+        let digest = blake3::hash(bytes);
+        let mut seen = self.0.discovered.lock().expect("discovery cache poisoned");
+        if let Some(previous) = seen.get(&peer)
+            && (contact.sequence() < previous.sequence
+                || (contact.sequence() == previous.sequence && digest != previous.digest))
+        {
+            return Err(Error::Protocol("discovery rollback"));
+        }
+        if !seen.contains_key(&peer) && seen.len() >= MAX_DISCOVERED {
+            seen.retain(|_, entry| entry.expires > now);
+            if seen.len() >= MAX_DISCOVERED {
+                return Err(Error::Protocol("discovery cache full"));
+            }
+        }
+        seen.insert(
+            peer,
+            Discovered {
+                sequence: contact.sequence(),
+                expires: contact.expires(),
+                digest,
+            },
+        );
+        Ok(())
+    }
+
     fn wrap(&self, accepted: Accepted) -> Connection {
         Connection {
             alpn: accepted.alpn,
@@ -740,6 +813,27 @@ impl IdentityEndpoint {
             remote_id: accepted.remote_id,
             _endpoint: self.clone(),
         }
+    }
+
+    /// Publish current reachable addresses, signed by this endpoint's credential.
+    ///
+    /// Persist and increase `sequence` on each update. This does not rotate trust.
+    pub async fn publish(&self, sequence: u64, validity: std::time::Duration) -> Result<(), Error> {
+        let lookup = self
+            .0
+            .lookup
+            .as_ref()
+            .ok_or(Error::Protocol("discovery not configured"))?;
+        let address = self.addr()?;
+        let mut addresses = address.addrs;
+        if !address.addr.ip().is_unspecified() && address.addr.port() != 0 {
+            addresses.insert(TransportAddr::Ip(address.addr));
+        }
+        let now = unix_seconds()?;
+        let expires = now.checked_add(validity.as_secs()).ok_or(Error::Encoding)?;
+        let contact =
+            super::SignedContact::sign(&self.0.identity, sequence, now, expires, addresses)?;
+        lookup.publish(contact).await
     }
 
     /// Join a relay named in a dial hint, evicting an idle dialed relay if needed.

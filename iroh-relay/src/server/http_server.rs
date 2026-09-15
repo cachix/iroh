@@ -756,12 +756,36 @@ impl RelayServiceWithNotify {
 impl Service<Request<Incoming>> for RelayServiceWithNotify {
     type Response = Response<BytesBody>;
     type Error = HyperError;
-    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+    /// Every legacy route answers synchronously; only the identity discovery
+    /// route reads a request body, so only that branch is boxed.
+    type Future = n0_future::Either<
+        std::future::Ready<Result<Self::Response, Self::Error>>,
+        std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>,
+    >;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         #[cfg(feature = "unstable-identity")]
+        if req
+            .uri()
+            .path()
+            .starts_with(crate::identity::DISCOVERY_PATH)
+            && let Some(service) = self.service.0.identity.get().cloned()
+        {
+            let source = self.source_ip;
+            let headers = self.service.0.headers.clone();
+            return n0_future::Either::Right(Box::pin(async move {
+                let (mut parts, body) = service.discovery(req, source).await.into_parts();
+                // Discovery answers carry the operator's configured headers like
+                // every other relay response.
+                for (key, value) in headers.iter() {
+                    parts.headers.insert(key, value.clone());
+                }
+                Ok(Response::from_parts(parts, Box::new(body) as BytesBody))
+            }));
+        }
+        #[cfg(feature = "unstable-identity")]
         if req.method() == Method::GET && req.uri().path() == crate::identity::PATH {
-            return std::future::ready(self.handle_identity_upgrade(req));
+            return n0_future::Either::Left(std::future::ready(self.handle_identity_upgrade(req)));
         }
         // Create a client if the request hits the relay endpoint.
         if matches!(
@@ -782,7 +806,7 @@ impl Service<Request<Incoming>> for RelayServiceWithNotify {
                     .body(body_full(e.to_string())),
             }
             .map_err(Into::into);
-            return std::future::ready(response);
+            return n0_future::Either::Left(std::future::ready(response));
         }
         // Otherwise handle the relay connection as normal.
 
@@ -795,7 +819,7 @@ impl Service<Request<Incoming>> for RelayServiceWithNotify {
             .get(&(req.method().clone(), uri.path()))
         {
             let response = handler(req, self.service.0.default_response());
-            return std::future::ready(response);
+            return n0_future::Either::Left(std::future::ready(response));
         }
 
         // Otherwise return 404
@@ -803,7 +827,7 @@ impl Service<Request<Incoming>> for RelayServiceWithNotify {
             .service
             .0
             .not_found_fn(req, self.service.0.default_response());
-        std::future::ready(response)
+        n0_future::Either::Left(std::future::ready(response))
     }
 }
 
