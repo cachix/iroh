@@ -143,8 +143,11 @@ proves possession over a fresh, URL-bound challenge. Legacy `/relay` is unchange
 A PQ deployment requires relays supporting this new protocol. Existing public
 relays are not automatically upgraded by this feature.
 
-Supply the expected identity and its direct or relay locations in `EndpointAddr`.
-Signed-contact lookup and publication are deferred to a separate contribution.
+`HttpDiscovery` publishes and retrieves signed contact records. The endpoint
+checks identity, remote policy, signature, canonical encoding, expiration and
+observed sequence rollbacks before using a record. `connect(peer_id, alpn)` uses
+configured discovery. Publishing is explicit; applications persist and increase
+record sequences and republish before expiry.
 
 QUIC address discovery uses the same UDP sockets and configured relay QAD ports.
 NAT traversal exchanges candidates inside the authenticated QUIC connection.
@@ -156,8 +159,8 @@ Endpoint clones share their runtime. Connections retain it after endpoint handle
 are dropped. Path tasks hold only weak connection handles, so dropping the last
 `Connection` closes it implicitly. `close().await` drains QUIC and cancels
 managed relay, QAD and path tasks. Relay reconnects retain the credential and
-never fall back to Ed25519. Relay and QAD HTTPS use the builder's
-crypto provider.
+never fall back to Ed25519. Relay, QAD and discovery HTTPS use the builder's
+crypto provider; `HttpDiscovery::with_provider` accepts the same provider.
 
 Keys use the versioned `IRID` encoding; Ed25519 retains its raw 32-byte secret,
 ML-DSA-65 stores PKCS#8, and custom signers may be non-exportable. Unix key files

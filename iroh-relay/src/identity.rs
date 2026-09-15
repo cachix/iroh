@@ -17,6 +17,8 @@ use tokio_websockets::{Message, WebSocketStream};
 pub const PATH: &str = "/relay/identity-v1";
 /// Required WebSocket subprotocol, with no legacy fallback.
 pub const PROTOCOL: &str = "iroh-identity-relay/1";
+/// Prefix for signed, expiring identity contact records.
+pub const DISCOVERY_PATH: &str = "/identity/discovery/v1/";
 const MAX_FRAME: usize = 66000;
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Both ends ping an idle session so a silently dead TCP connection is

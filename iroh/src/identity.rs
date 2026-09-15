@@ -2,7 +2,7 @@
 //!
 //! The normal endpoint builder's `credentials` method selects this typed API.
 //! It supports Ed25519 and ML-DSA-65 authentication, direct IP and versioned relay
-//! routing, key persistence and explicit trust migration.
+//! routing, signed discovery, key persistence and explicit trust migration.
 //! QUIC performs authenticated NAT traversal without changing the peer identity.
 //! The native API and `iroh-pid1-` encoding are experimental and are not covered
 //! by semantic versioning guarantees. Session resumption is disabled.
@@ -30,12 +30,15 @@
 //! # Ok(()) }
 //! ```
 
+mod discovery;
 pub(crate) mod endpoint;
 mod paths;
 mod routing;
 mod tls;
 
+pub use discovery::{AddressLookup, HttpDiscovery, LookupFuture};
 pub use endpoint::{Builder, Connection, EndpointAddr, IdentityEndpoint};
+pub use iroh_identity::SignedContact;
 pub use iroh_identity::{
     BuiltinAlgorithm, Error, IdentityAlgorithm, LocalIdentity, PeerId, Registry, RemotePolicy,
     SecretBytes, TrustStore,

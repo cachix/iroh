@@ -5,6 +5,8 @@
 mod binding;
 #[path = "identity/client_auth.rs"]
 mod client_auth;
+#[path = "identity/discovery.rs"]
+mod discovery;
 #[path = "identity/encoding.rs"]
 mod encoding;
 #[path = "identity/handshake.rs"]

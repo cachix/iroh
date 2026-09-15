@@ -2,10 +2,12 @@
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 
 mod crypto;
+mod discovery;
 mod trust;
 pub use crypto::{
     BuiltinAlgorithm, IdentityAlgorithm, LocalIdentity, PeerId, Registry, RemotePolicy, SecretBytes,
 };
+pub use discovery::{MAX_CONTACT_SIZE, SignedContact};
 pub use trust::TrustStore;
 
 /// Errors from identity configuration, parsing, or connection establishment.

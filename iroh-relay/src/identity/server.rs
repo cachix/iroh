@@ -20,6 +20,8 @@ use super::*;
 #[derive(Clone, Debug)]
 pub struct Service(Arc<Inner>);
 
+type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
+
 #[derive(derive_more::Debug)]
 struct Inner {
     audience: RelayUrl,
@@ -30,8 +32,13 @@ struct Inner {
     sessions: AtomicU64,
     capacity: Arc<Semaphore>,
     cancel: CancellationToken,
+    contacts: Mutex<HashMap<PeerId, iroh_identity::SignedContact>>,
+    max_contacts: usize,
     sources: Mutex<HashMap<Option<IpAddr>, Source>>,
     source_prune: Mutex<Option<tokio::time::Instant>>,
+    discovery_capacity: Semaphore,
+    #[debug(skip)]
+    clock: Clock,
 }
 
 const SOURCE_WINDOW: Duration = Duration::from_secs(60);
@@ -106,20 +113,36 @@ impl Drop for Registration {
     }
 }
 
+fn system_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|v| v.as_secs())
+        .unwrap_or(0)
+}
+
 impl Service {
     /// Enable typed registration with a bounded number of concurrent sessions.
     ///
-    /// Identity relay upgrades and sessions share limits per canonical source IP:
+    /// Identity HTTP requests and sessions share limits per canonical source IP:
     /// 120 admissions per minute, 16 concurrent operations, and relay ingress of
     /// 64 MiB / 32,768 frames per second. Traffic excess disconnects the session;
     /// HTTP admission excess returns 429. Windows are fixed, not sliding.
-    /// Source state is bounded to 4096 entries; inactive entries are reclaimable
-    /// after a minute.
+    /// Discovery also has a global limit of 64 concurrent requests. Source state
+    /// is bounded to 4096 entries; inactive entries are reclaimable after a minute.
     ///
     /// A new registration for an already registered identity replaces the
     /// previous session, so a client whose connection died silently can
     /// reconnect. Idle sessions are pinged and dropped when they stop answering.
     pub fn new(audience: RelayUrl, registry: Arc<Registry>, max_sessions: usize) -> Self {
+        Self::with_clock(audience, registry, max_sessions, Box::new(system_seconds))
+    }
+
+    fn with_clock(
+        audience: RelayUrl,
+        registry: Arc<Registry>,
+        max_sessions: usize,
+        clock: Clock,
+    ) -> Self {
         Self(Arc::new(Inner {
             audience,
             registry,
@@ -127,8 +150,12 @@ impl Service {
             sessions: AtomicU64::new(0),
             capacity: Arc::new(Semaphore::new(max_sessions)),
             cancel: CancellationToken::new(),
+            contacts: Mutex::new(HashMap::new()),
+            max_contacts: max_sessions,
             sources: Mutex::new(HashMap::new()),
             source_prune: Mutex::new(None),
+            discovery_capacity: Semaphore::new(64),
+            clock,
         }))
     }
 
@@ -182,6 +209,84 @@ impl Service {
         state.requests += 1;
         state.active += 1;
         Some(SourceLease(self.clone(), source))
+    }
+
+    pub(crate) async fn discovery<B>(
+        &self,
+        request: hyper::Request<B>,
+        source: Option<IpAddr>,
+    ) -> hyper::Response<http_body_util::Full<Bytes>>
+    where
+        B: hyper::body::Body,
+        B::Data: bytes::Buf,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        use http_body_util::BodyExt;
+        use hyper::{Method, StatusCode};
+        let response = |status, bytes: Bytes| {
+            hyper::Response::builder()
+                .status(status)
+                .body(http_body_util::Full::new(bytes))
+                .expect("valid response")
+        };
+        let Some(_source) = self.admit(source) else {
+            return response(StatusCode::TOO_MANY_REQUESTS, Bytes::new());
+        };
+        let Ok(_permit) = self.0.discovery_capacity.try_acquire() else {
+            return response(StatusCode::SERVICE_UNAVAILABLE, Bytes::new());
+        };
+        let Some(peer) = request
+            .uri()
+            .path()
+            .strip_prefix(DISCOVERY_PATH)
+            .and_then(|v| v.parse::<PeerId>().ok())
+        else {
+            return response(StatusCode::BAD_REQUEST, Bytes::new());
+        };
+        match *request.method() {
+            Method::GET => {
+                let now = (self.0.clock)();
+                let contacts = self.0.contacts.lock().expect("contacts poisoned");
+                match contacts.get(&peer).filter(|v| v.expires() > now) {
+                    Some(record) => {
+                        response(StatusCode::OK, Bytes::copy_from_slice(record.as_bytes()))
+                    }
+                    None => response(StatusCode::NOT_FOUND, Bytes::new()),
+                }
+            }
+            Method::PUT => {
+                let body = http_body_util::Limited::new(
+                    request.into_body(),
+                    iroh_identity::MAX_CONTACT_SIZE,
+                );
+                let Ok(Ok(body)) = tokio::time::timeout(TIMEOUT, body.collect()).await else {
+                    return response(StatusCode::PAYLOAD_TOO_LARGE, Bytes::new());
+                };
+                let bytes = body.to_bytes();
+                // Upload time must not extend a signed record's lifetime.
+                let now = (self.0.clock)();
+                let Ok(record) =
+                    iroh_identity::SignedContact::verify(&bytes, peer, &self.0.registry, now)
+                else {
+                    return response(StatusCode::FORBIDDEN, Bytes::new());
+                };
+                let mut contacts = self.0.contacts.lock().expect("contacts poisoned");
+                contacts.retain(|_, value| value.expires() > now);
+                if let Some(old) = contacts.get(&peer) {
+                    if record.sequence() < old.sequence()
+                        || (record.sequence() == old.sequence()
+                            && record.as_bytes() != old.as_bytes())
+                    {
+                        return response(StatusCode::CONFLICT, Bytes::new());
+                    }
+                } else if contacts.len() >= self.0.max_contacts {
+                    return response(StatusCode::SERVICE_UNAVAILABLE, Bytes::new());
+                }
+                contacts.insert(peer, record);
+                response(StatusCode::NO_CONTENT, Bytes::new())
+            }
+            _ => response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new()),
+        }
     }
 
     pub(crate) async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
@@ -479,5 +584,53 @@ mod tests {
         other.close().await.unwrap();
         assert!(other_task.await.unwrap().is_ok());
         assert!(service.0.clients.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_checks_expiry_after_reading_the_request_body() {
+        use std::sync::atomic::AtomicU64;
+
+        use hyper::body::Frame;
+
+        let registry = Arc::new(Registry::builtins(vec![2]).unwrap());
+        let identity = LocalIdentity::generate_ml_dsa65(&registry).unwrap();
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let clock = now.clone();
+        let service = Service::with_clock(
+            "https://relay.example/".parse().unwrap(),
+            registry,
+            4,
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        );
+        let start = now.load(Ordering::Relaxed);
+        let record = iroh_identity::SignedContact::sign(
+            &identity,
+            1,
+            start,
+            start + 2,
+            std::collections::BTreeSet::from([iroh_base::TransportAddr::Ip(
+                "127.0.0.1:1234".parse().unwrap(),
+            )]),
+        )
+        .unwrap();
+        let bytes = Bytes::copy_from_slice(record.as_bytes());
+        // The record expires while the server is still reading its body.
+        let expiring = now.clone();
+        let chunks = n0_future::stream::iter([bytes.slice(..1), bytes.slice(1..)])
+            .enumerate()
+            .map(move |(index, chunk)| {
+                if index == 1 {
+                    expiring.store(start + 3, Ordering::Relaxed);
+                }
+                Ok::<_, std::convert::Infallible>(Frame::data(chunk))
+            });
+        let request = hyper::Request::builder()
+            .method(hyper::Method::PUT)
+            .uri(format!("{DISCOVERY_PATH}{}", identity.id()))
+            .body(http_body_util::StreamBody::new(chunks))
+            .unwrap();
+        let response = service.discovery(request, None).await;
+        assert_eq!(response.status(), hyper::StatusCode::FORBIDDEN);
+        assert!(service.0.contacts.lock().unwrap().is_empty());
     }
 }
