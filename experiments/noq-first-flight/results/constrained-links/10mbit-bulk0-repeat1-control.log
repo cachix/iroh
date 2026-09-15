@@ -1,0 +1,19 @@
+qdisc htb 1: root refcnt 2 r2q 10 default 0x10 direct_packets_stat 0 direct_qlen 1000
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+qdisc netem 10: parent 1:10 limit 32 delay 50ms seed 6958083060284829130
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+BULK_RESULT seconds=20.021199 bytes=0 mbps=0.000000 handshakes_per_second=0.998941
+qdisc htb 1: root refcnt 2 r2q 10 default 0x10 direct_packets_stat 0 direct_qlen 1000
+ Sent 521041 bytes 821 pkt (dropped 0, overlimits 103 requeues 0) 
+ backlog 0b 0p requeues 0
+qdisc netem 10: parent 1:10 limit 32 delay 50ms seed 6958083060284829130
+ Sent 521041 bytes 821 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+class htb 1:10 root leaf 10: prio 0 rate 10Mbit ceil 10Mbit burst 1500b cburst 1500b
+ Sent 521041 bytes 821 pkt (dropped 0, overlimits 103 requeues 0) 
+ backlog 0b 0p requeues 0
+ lended: 821 borrowed: 0 giants: 0
+ tokens: 17550 ctokens: 17550
+

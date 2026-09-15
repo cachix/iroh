@@ -1,0 +1,6 @@
+/noq/
+**/target/
+/reproduced*.log
+/reproduced*.csv
+/reproduced/
+/reproduced-constrained/

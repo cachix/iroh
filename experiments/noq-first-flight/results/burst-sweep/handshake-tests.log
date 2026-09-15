@@ -1,0 +1,12 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (/home/domen/.cargo/build/40/a2043093ff9e39/release/deps/noq_proto-a6a82ca3415adb36)
+
+running 5 tests
+test tests::handshake_sequence ... ok
+test tests::handshake_1rtt_handling ... ok
+test tests::high_latency_handshake ... ok
+test tests::handshake_anti_deadlock_probe ... ok
+test tests::handshake_confirmation_no_resumption_shortcut ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 425 filtered out; finished in 0.00s
+

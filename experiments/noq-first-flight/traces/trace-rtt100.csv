@@ -1,0 +1,3 @@
+suite,sample,handshake_us,client_tx_bytes,server_tx_bytes,status
+Ed25519,0,152880,4948,2701,ok
+ML-DSA-65,0,290370,10706,8657,ok

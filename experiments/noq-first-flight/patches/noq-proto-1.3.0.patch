@@ -1,0 +1,77 @@
+--- a/src/connection/mod.rs
++++ b/src/connection/mod.rs
+@@ -156,6 +156,10 @@
+ /// call to [`handle_event`](Self::handle_event) at that same instant; however
+ /// events or timeouts with different instants must not be interleaved.
+ pub struct Connection {
++    // External benchmark prototype only: bounded first-flight scheduling credits.
++    prototype_initial_padding: bool,
++    prototype_initial_burst_remaining: u64,
++    prototype_handshake_burst_remaining: u64,
+     endpoint_config: Arc<EndpointConfig>,
+     config: Arc<TransportConfig>,
+     rng: StdRng,
+@@ -361,6 +365,9 @@
+         )]);
+ 
+         let mut this = Self {
++            prototype_initial_padding: std::env::var_os("BENCH_INITIAL_PAD").is_some(),
++            prototype_initial_burst_remaining: if std::env::var_os("BENCH_INITIAL_PAD").is_some() { 2400 } else { 0 },
++            prototype_handshake_burst_remaining: if std::env::var_os("BENCH_HANDSHAKE_BURST").is_some() { 9600 } else { 0 },
+             endpoint_config,
+             crypto_state: CryptoState::new(crypto, init_cid, side, &mut rng),
+             handshake_cid: local_cid,
+@@ -1727,6 +1734,17 @@
+ 
+             self.populate_packet(now, space_id, path_id, scheduling_info, &mut builder);
+ 
++            // Queue exactly one extra ack-eliciting Initial after the first.
++            // The existing Initial padding path produces a second 1200-byte UDP
++            // datagram, without raising the path's MTU or the server's limit.
++            if self.prototype_initial_padding
++                && self.side.is_client()
++                && space_id == SpaceId::Initial
++                && builder.packet_number == 0
++            {
++                self.spaces[space_id].for_path(path_id).pending_ping = true;
++            }
++
+             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
+             // any other reason, there is a bug which leads to one component announcing write
+             // readiness while not writing any data. This degrades performance. The condition is
+@@ -1977,6 +1995,35 @@
+             }
+         }
+ 
++        // Diagnostic first-flight bursts, after amplification and congestion
++        // checks. Preserve explicit rate caps and all application-data pacing.
++        if path_id == PathId::ZERO
++            && self.config.max_outgoing_bytes_per_second.is_none()
++            && !need_loss_probe
++            && !can_send.close
++        {
++            let budget = if space_id == SpaceId::Initial && self.side.is_client() {
++                &mut self.prototype_initial_burst_remaining
++            } else if space_id == SpaceId::Handshake {
++                &mut self.prototype_handshake_burst_remaining
++            } else {
++                return self.prototype_normal_pacing(space_id, path_id, bytes_to_send, now);
++            };
++            if *budget >= bytes_to_send {
++                // The caller checks the aggregate's capacity after this check.
++                // Do not spend a credit on a packet that cannot be built yet.
++                if transmit.num_datagrams() < transmit.max_datagrams().get() {
++                    *budget -= bytes_to_send;
++                    trace!(?space_id, bytes_to_send, "prototype first-flight burst");
++                }
++                return PathBlocked::No;
++            }
++        }
++
++        self.prototype_normal_pacing(space_id, path_id, bytes_to_send, now)
++    }
++
++    fn prototype_normal_pacing(&mut self, space_id: SpaceId, path_id: PathId, bytes_to_send: u64, now: Instant) -> PathBlocked {
+         // Pacing check.
+         if let Some(delay) = self.path_data_mut(path_id).pacing_delay(bytes_to_send, now) {
+             let resume_time = now + delay;

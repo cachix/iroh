@@ -1,0 +1,7 @@
+qdisc netem 802a: root refcnt 2 limit 1000 delay 50ms seed 3904309256057270042
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+BULK_RESULT seconds=12.944128 bytes=0 mbps=0.000000 handshakes_per_second=3.090204
+qdisc netem 802a: root refcnt 2 limit 1000 delay 50ms seed 3904309256057270042
+ Sent 926569 bytes 1331 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0

@@ -1,0 +1,3 @@
+# Preserve raw tool output and the whitespace required by unified diff context.
+*.log -whitespace
+*.patch -whitespace

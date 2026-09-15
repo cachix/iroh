@@ -1,0 +1,13 @@
+qdisc htb 1: root refcnt 2 r2q 10 default 0x10 direct_packets_stat 0 direct_qlen 1000
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+qdisc netem 10: parent 1:10 limit 32 delay 50ms seed 1461935780485219970
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+BULK_RESULT seconds=40.041291 bytes=15662691 mbps=3.129308 handshakes_per_second=0.998969
+qdisc htb 1: root refcnt 2 r2q 10 default 0x10 direct_packets_stat 0 direct_qlen 1000
+ Sent 23496736 bytes 22943 pkt (dropped 162, overlimits 9872 requeues 0) 
+ backlog 1412b 16p requeues 0
+qdisc netem 10: parent 1:10 limit 32 delay 50ms seed 1461935780485219970
+ Sent 23496736 bytes 22943 pkt (dropped 162, overlimits 0 requeues 0) 
+ backlog 1412b 16p requeues 0

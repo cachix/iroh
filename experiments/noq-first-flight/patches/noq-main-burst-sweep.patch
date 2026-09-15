@@ -1,0 +1,318 @@
+diff --git a/noq-proto/src/connection/mod.rs b/noq-proto/src/connection/mod.rs
+index 5a89682..3950859 100644
+--- a/noq-proto/src/connection/mod.rs
++++ b/noq-proto/src/connection/mod.rs
+@@ -156,6 +156,10 @@ use state::StateType;
+ /// call to [`handle_event`](Self::handle_event) at that same instant; however
+ /// events or timeouts with different instants must not be interleaved.
+ pub struct Connection {
++    // External benchmark prototype only: bounded first-flight scheduling credits.
++    prototype_initial_padding: bool,
++    prototype_initial_burst_remaining: u64,
++    prototype_handshake_burst_remaining: u64,
+     endpoint_config: Arc<EndpointConfig>,
+     config: Arc<TransportConfig>,
+     rng: StdRng,
+@@ -361,6 +365,13 @@ impl Connection {
+         )]);
+ 
+         let mut this = Self {
++            prototype_initial_padding: std::env::var_os("BENCH_INITIAL_PAD").is_some(),
++            prototype_initial_burst_remaining: if std::env::var_os("BENCH_INITIAL_PAD").is_some() { 2400 } else { 0 },
++            prototype_handshake_burst_remaining: if std::env::var_os("BENCH_HANDSHAKE_BURST").is_some() {
++                std::env::var("BENCH_HANDSHAKE_BURST_BYTES")
++                    .map(|v| v.parse().expect("invalid diagnostic burst byte budget"))
++                    .unwrap_or(9600)
++            } else { 0 },
+             endpoint_config,
+             crypto_state: CryptoState::new(crypto, init_cid, side, &mut rng),
+             handshake_cid: local_cid,
+@@ -1736,6 +1747,17 @@ impl Connection {
+ 
+             self.populate_packet(now, space_id, path_id, scheduling_info, &mut builder);
+ 
++            // Queue exactly one extra ack-eliciting Initial after the first.
++            // The existing Initial padding path produces a second 1200-byte UDP
++            // datagram, without raising the path's MTU or the server's limit.
++            if self.prototype_initial_padding
++                && self.side.is_client()
++                && space_id == SpaceId::Initial
++                && builder.packet_number == 0
++            {
++                self.spaces[space_id].for_path(path_id).pending_ping = true;
++            }
++
+             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
+             // any other reason, there is a bug which leads to one component announcing write
+             // readiness while not writing any data. This degrades performance. The condition is
+@@ -1986,6 +2008,35 @@ impl Connection {
+             }
+         }
+ 
++        // Diagnostic first-flight bursts, after amplification and congestion
++        // checks. Preserve explicit rate caps and all application-data pacing.
++        if path_id == PathId::ZERO
++            && self.config.max_outgoing_bytes_per_second.is_none()
++            && !need_loss_probe
++            && !can_send.close
++        {
++            let budget = if space_id == SpaceId::Initial && self.side.is_client() {
++                &mut self.prototype_initial_burst_remaining
++            } else if space_id == SpaceId::Handshake {
++                &mut self.prototype_handshake_burst_remaining
++            } else {
++                return self.prototype_normal_pacing(space_id, path_id, bytes_to_send, now);
++            };
++            if *budget >= bytes_to_send {
++                // The caller checks the aggregate's capacity after this check.
++                // Do not spend a credit on a packet that cannot be built yet.
++                if transmit.num_datagrams() < transmit.max_datagrams().get() {
++                    *budget -= bytes_to_send;
++                    trace!(?space_id, bytes_to_send, "prototype first-flight burst");
++                }
++                return PathBlocked::No;
++            }
++        }
++
++        self.prototype_normal_pacing(space_id, path_id, bytes_to_send, now)
++    }
++
++    fn prototype_normal_pacing(&mut self, space_id: SpaceId, path_id: PathId, bytes_to_send: u64, now: Instant) -> PathBlocked {
+         // Pacing check.
+         if let Some(delay) = self.path_data_mut(path_id).pacing_delay(bytes_to_send, now) {
+             let resume_time = now + delay;
+@@ -2745,6 +2796,13 @@ impl Connection {
+         self.crypto_state.session.as_ref()
+     }
+ 
++    #[cfg(test)]
++    pub(crate) fn prototype_first_flight_for_test(&mut self, padding: bool, budget: u64) {
++        self.prototype_initial_padding = padding;
++        self.prototype_initial_burst_remaining = if padding { 2400 } else { 0 };
++        self.prototype_handshake_burst_remaining = budget;
++    }
++
+     /// Whether the connection is in the process of being established
+     ///
+     /// If this returns `false`, the connection may be either established or closed, signaled by the
+diff --git a/noq-proto/src/tests/first_flight.rs b/noq-proto/src/tests/first_flight.rs
+new file mode 100644
+index 0000000..b461f22
+--- /dev/null
++++ b/noq-proto/src/tests/first_flight.rs
+@@ -0,0 +1,171 @@
++//! External diagnostic: large TLS messages traversing a small deterministic queue.
++//! This deliberately isolates queue capacity, rather than simulating a competing CUBIC flow.
++use super::*;
++
++#[derive(Debug, PartialEq, Eq)]
++struct Outcome {
++    handshake_us: u128,
++    lost: u64,
++    crypto_frames: u64,
++}
++
++fn simulate(padding: bool, budget: u64, queue_bytes: u32, seed: u8) -> Outcome {
++    let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
++    params.serial_number = Some(rcgen::SerialNumber::from(1u64));
++    params
++        .custom_extensions
++        .push(rcgen::CustomExtension::from_oid_content(
++            &[1, 3, 6, 1, 4, 1, 55555, 1],
++            vec![0x42; 5000],
++        ));
++    // Ed25519 fixes signature lengths; only the large TLS flight matters here.
++    // Fixed test-only seed encoded as PKCS#8, so the certificate is identical on every run.
++    let mut key_der = hex!("302e020100300506032b657004220420").to_vec();
++    key_der.extend_from_slice(&[7; 32]);
++    let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
++        &PrivatePkcs8KeyDer::from(key_der),
++        &rcgen::PKCS_ED25519,
++    )
++    .unwrap();
++    let cert = params.self_signed(&key).unwrap();
++    let mut endpoint_config = EndpointConfig::default();
++    endpoint_config.rng_seed(Some([seed; 32]));
++    let mut transport = TransportConfig::default();
++    transport.deterministic_packet_numbers(true);
++    transport.mtu_discovery_config(None);
++    let transport = Arc::new(transport);
++    let mut server = server_config_with_cert(
++        cert.der().clone(),
++        PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
++    );
++    server.transport = transport.clone();
++    let mut client = client_config_with_certs(vec![cert.der().clone()]);
++    client.transport = transport;
++    let mut pair = Pair::new(Arc::new(endpoint_config), server);
++    pair.routes = BwLimitedRouting::new(
++        Pair::CLIENT_ADDR,
++        Pair::SERVER_ADDR,
++        pair.time,
++        BwLimitConfig {
++            bytes_per_second: 1_250_000,
++            buffer_size: queue_bytes,
++            latency: Duration::from_millis(50),
++        },
++    )
++    .into();
++    pair.server.prototype_first_flight = Some((padding, budget));
++    let client_ch = pair.begin_connect(client);
++    pair.client_conn_mut(client_ch)
++        .prototype_first_flight_for_test(padding, budget);
++    let start = pair.time;
++    let server_ch = loop {
++        pair.drive_client();
++        pair.drive_server();
++        assert!(
++            !pair.client_conn_mut(client_ch).is_closed(),
++            "client closed"
++        );
++        if let Some(Ok(server_ch)) = pair.server.accepted {
++            assert!(
++                !pair.server_conn_mut(server_ch).is_closed(),
++                "server closed"
++            );
++            if !pair.client_conn_mut(client_ch).is_handshaking()
++                && !pair.server_conn_mut(server_ch).is_handshaking()
++            {
++                break server_ch;
++            }
++        }
++        assert!(
++            pair.time.duration_since(start) < Duration::from_secs(5),
++            "handshake stuck"
++        );
++        assert!(pair.advance_time(), "no wakeup before handshake completed");
++    };
++    let handshake_us = pair.time.duration_since(start).as_micros();
++    // Drain ACKs so loss accounting includes the completed handshake.
++    pair.drive();
++    pair.finish_connect(client_ch, server_ch);
++    let client_stats = pair.client_conn_mut(client_ch).stats();
++    let server_stats = pair.server_conn_mut(server_ch).stats();
++    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
++    let payload = b"authenticated data after the queued handshake";
++    assert_eq!(
++        pair.client_send(client_ch, stream).write(payload).unwrap(),
++        payload.len()
++    );
++    pair.client_send(client_ch, stream).finish().unwrap();
++    pair.drive();
++    assert_eq!(
++        pair.server_streams(server_ch).accept(Dir::Uni),
++        Some(stream)
++    );
++    let mut recv = pair.server_recv(server_ch, stream);
++    let mut chunks = recv.read(false).unwrap();
++    assert_eq!(
++        chunks.next(usize::MAX).unwrap().unwrap().bytes.as_ref(),
++        payload
++    );
++    assert!(chunks.next(usize::MAX).unwrap().is_none());
++    let _ = chunks.finalize();
++    Outcome {
++        handshake_us,
++        lost: client_stats.lost_packets + server_stats.lost_packets,
++        crypto_frames: client_stats.frame_tx.crypto + server_stats.frame_tx.crypto,
++    }
++}
++
++#[test]
++fn diagnostic_first_flight_queue_sweep() {
++    for queue in [1200, 2400, 3600, 9600] {
++        for (padding, budget) in [
++            (false, 0),
++            (true, 0),
++            (true, 2400),
++            (true, 4800),
++            (true, 9600),
++        ] {
++            let a = simulate(padding, budget, queue, 7);
++            let b = simulate(padding, budget, queue, 7);
++            assert_eq!(a, b, "same seeded scenario should have the same outcome");
++            println!(
++                "QUEUE_RESULT queue_bytes={queue} padding={padding} budget={budget} us={} lost={} crypto={}",
++                a.handshake_us, a.lost, a.crypto_frames
++            );
++        }
++    }
++}
++
++#[test]
++fn first_flight_small_queue_burst_regression() {
++    for seed in [0, 1, 7, 42] {
++        let control = simulate(false, 0, 2400, seed);
++        let large = simulate(true, 9600, 2400, seed);
++        let small = simulate(true, 2400, 2400, seed);
++        assert_eq!(large, simulate(true, 9600, 2400, seed));
++        assert_eq!(control.lost, 0);
++        assert!(large.lost > 0);
++        assert!(large.handshake_us > control.handshake_us);
++        assert_eq!(small.lost, 0);
++        assert!(small.handshake_us < control.handshake_us);
++    }
++}
++
++#[test]
++fn first_flight_smaller_burst_is_not_universally_safe() {
++    let control = simulate(false, 0, 1200, 7);
++    let small = simulate(true, 2400, 1200, 7);
++    assert_eq!(control.lost, 0);
++    assert!(small.lost > 0);
++    assert!(small.handshake_us > control.handshake_us);
++}
++
++#[test]
++fn first_flight_roomy_queue_rewards_larger_burst() {
++    let control = simulate(false, 0, 9600, 7);
++    let small = simulate(true, 2400, 9600, 7);
++    let large = simulate(true, 9600, 9600, 7);
++    assert_eq!(large.lost, 0);
++    assert!(large.handshake_us < small.handshake_us);
++    assert!(small.handshake_us < control.handshake_us);
++}
+diff --git a/noq-proto/src/tests/mod.rs b/noq-proto/src/tests/mod.rs
+index 50ad621..0d086ec 100644
+--- a/noq-proto/src/tests/mod.rs
++++ b/noq-proto/src/tests/mod.rs
+@@ -61,6 +61,7 @@ mod proptests;
+ #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+ mod random_interaction;
+ mod token;
++mod first_flight;
+ 
+ #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+ use wasm_bindgen_test::wasm_bindgen_test as test;
+diff --git a/noq-proto/src/tests/util.rs b/noq-proto/src/tests/util.rs
+index 90af6ea..87e5973 100644
+--- a/noq-proto/src/tests/util.rs
++++ b/noq-proto/src/tests/util.rs
+@@ -1125,6 +1125,7 @@ impl Default for Pair {
+ 
+ #[derive(derive_more::Debug)]
+ pub(super) struct TestEndpoint {
++    pub(super) prototype_first_flight: Option<(bool, u64)>,
+     pub(super) endpoint: Endpoint,
+     timeout: Option<Instant>,
+     pub(super) outbound: VecDeque<(Transmit, Bytes)>,
+@@ -1274,6 +1275,7 @@ pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavi
+ impl TestEndpoint {
+     fn new(endpoint: Endpoint) -> Self {
+         Self {
++            prototype_first_flight: None,
+             endpoint,
+             timeout: None,
+             outbound: VecDeque::new(),
+@@ -1420,7 +1422,10 @@ impl TestEndpoint {
+     ) -> Result<ConnectionHandle, ConnectionError> {
+         let mut buf = Vec::new();
+         match self.endpoint.accept(incoming, now, &mut buf, None) {
+-            Ok((ch, conn)) => {
++            Ok((ch, mut conn)) => {
++                if let Some((padding, budget)) = self.prototype_first_flight {
++                    conn.prototype_first_flight_for_test(padding, budget);
++                }
+                 self.connections.insert(ch, conn);
+                 self.accepted = Some(Ok(ch));
+                 Ok(ch)

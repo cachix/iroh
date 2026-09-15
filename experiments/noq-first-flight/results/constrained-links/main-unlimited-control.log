@@ -1,0 +1,4 @@
+BULK_RESULT seconds=15.671618 bytes=0 mbps=0.000000 handshakes_per_second=2.552385
+qdisc netem 8022: root refcnt 2 limit 1000 delay 50ms seed 7723754896051961151
+ Sent 867923 bytes 1347 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0

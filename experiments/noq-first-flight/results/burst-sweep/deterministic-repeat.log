@@ -1,0 +1,32 @@
+   Compiling noq-proto v1.3.0 (/tmp/noq-burst-sweep/noq-proto)
+    Finished `release` profile [optimized + debuginfo] target(s) in 24.46s
+     Running unittests src/lib.rs (/home/domen/.cargo/build/40/a2043093ff9e39/release/deps/noq_proto-a6a82ca3415adb36)
+
+running 4 tests
+test tests::first_flight::first_flight_smaller_burst_is_not_universally_safe ... ok
+QUEUE_RESULT queue_bytes=1200 padding=false budget=0 us=265402 lost=0 crypto=9
+test tests::first_flight::first_flight_roomy_queue_rewards_larger_burst ... ok
+QUEUE_RESULT queue_bytes=1200 padding=true budget=0 us=264724 lost=0 crypto=10
+QUEUE_RESULT queue_bytes=1200 padding=true budget=2400 us=279652 lost=4 crypto=11
+QUEUE_RESULT queue_bytes=1200 padding=true budget=4800 us=367679 lost=5 crypto=11
+QUEUE_RESULT queue_bytes=1200 padding=true budget=9600 us=367679 lost=6 crypto=11
+QUEUE_RESULT queue_bytes=2400 padding=false budget=0 us=261301 lost=0 crypto=9
+QUEUE_RESULT queue_bytes=2400 padding=true budget=0 us=260626 lost=0 crypto=10
+QUEUE_RESULT queue_bytes=2400 padding=true budget=2400 us=229977 lost=0 crypto=10
+test tests::first_flight::first_flight_small_queue_burst_regression ... ok
+QUEUE_RESULT queue_bytes=2400 padding=true budget=4800 us=321221 lost=5 crypto=11
+QUEUE_RESULT queue_bytes=2400 padding=true budget=9600 us=321221 lost=5 crypto=11
+QUEUE_RESULT queue_bytes=3600 padding=false budget=0 us=261301 lost=0 crypto=9
+QUEUE_RESULT queue_bytes=3600 padding=true budget=0 us=260626 lost=0 crypto=10
+QUEUE_RESULT queue_bytes=3600 padding=true budget=2400 us=229977 lost=0 crypto=10
+QUEUE_RESULT queue_bytes=3600 padding=true budget=4800 us=155806 lost=0 crypto=9
+QUEUE_RESULT queue_bytes=3600 padding=true budget=9600 us=155806 lost=0 crypto=9
+QUEUE_RESULT queue_bytes=9600 padding=false budget=0 us=261301 lost=0 crypto=9
+QUEUE_RESULT queue_bytes=9600 padding=true budget=0 us=260626 lost=0 crypto=10
+QUEUE_RESULT queue_bytes=9600 padding=true budget=2400 us=229977 lost=0 crypto=10
+QUEUE_RESULT queue_bytes=9600 padding=true budget=4800 us=155806 lost=0 crypto=9
+QUEUE_RESULT queue_bytes=9600 padding=true budget=9600 us=155806 lost=0 crypto=9
+test tests::first_flight::diagnostic_first_flight_queue_sweep ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 426 filtered out; finished in 0.04s
+

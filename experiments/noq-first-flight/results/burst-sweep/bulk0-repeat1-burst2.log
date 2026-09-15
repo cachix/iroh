@@ -1,0 +1,7 @@
+qdisc netem 8029: root refcnt 2 limit 1000 delay 50ms seed 1796538720748924283
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+BULK_RESULT seconds=14.579273 bytes=0 mbps=0.000000 handshakes_per_second=2.743621
+qdisc netem 8029: root refcnt 2 limit 1000 delay 50ms seed 1796538720748924283
+ Sent 928629 bytes 1389 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0

@@ -1,0 +1,21 @@
+[package]
+name = "iroh-identity-bench"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+iroh = { path = "../../../iroh", features = ["unstable-identity"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+libc = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "iroh-identity-bench"
+path = "../harness/src/main.rs"
+
+[patch.crates-io]
+noq = { path = "../noq/noq" }
+noq-proto = { path = "../noq/noq-proto" }
+noq-udp = { path = "../noq/noq-udp" }
