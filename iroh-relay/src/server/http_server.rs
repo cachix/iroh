@@ -528,6 +528,8 @@ pub struct RelayService(Arc<Inner>);
 
 #[derive(Debug)]
 struct Inner {
+    #[cfg(feature = "unstable-identity")]
+    identity: std::sync::OnceLock<crate::identity::Service>,
     handlers: Handlers,
     headers: HeaderMap,
     clients: Clients,
@@ -724,6 +726,8 @@ impl RelayServiceWithNotify {
 pub struct RelayServiceWithNotify {
     service: RelayService,
     on_establish: Arc<Notify>,
+    #[cfg(feature = "unstable-identity")]
+    source_ip: Option<std::net::IpAddr>,
 }
 
 impl RelayServiceWithNotify {
@@ -735,16 +739,54 @@ impl RelayServiceWithNotify {
         Self {
             service,
             on_establish,
+            #[cfg(feature = "unstable-identity")]
+            source_ip: None,
         }
+    }
+
+    /// Set the actual TCP source for identity admission limits when embedding.
+    /// Unset sources share one quota. Never pass untrusted forwarding headers.
+    #[cfg(feature = "unstable-identity")]
+    pub fn with_source_ip(mut self, source: std::net::IpAddr) -> Self {
+        self.source_ip = Some(source.to_canonical());
+        self
     }
 }
 
 impl Service<Request<Incoming>> for RelayServiceWithNotify {
     type Response = Response<BytesBody>;
     type Error = HyperError;
-    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+    /// Every legacy route answers synchronously; only the identity discovery
+    /// route reads a request body, so only that branch is boxed.
+    type Future = n0_future::Either<
+        std::future::Ready<Result<Self::Response, Self::Error>>,
+        std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>,
+    >;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
+        #[cfg(feature = "unstable-identity")]
+        if req
+            .uri()
+            .path()
+            .starts_with(crate::identity::DISCOVERY_PATH)
+            && let Some(service) = self.service.0.identity.get().cloned()
+        {
+            let source = self.source_ip;
+            let headers = self.service.0.headers.clone();
+            return n0_future::Either::Right(Box::pin(async move {
+                let (mut parts, body) = service.discovery(req, source).await.into_parts();
+                // Discovery answers carry the operator's configured headers like
+                // every other relay response.
+                for (key, value) in headers.iter() {
+                    parts.headers.insert(key, value.clone());
+                }
+                Ok(Response::from_parts(parts, Box::new(body) as BytesBody))
+            }));
+        }
+        #[cfg(feature = "unstable-identity")]
+        if req.method() == Method::GET && req.uri().path() == crate::identity::PATH {
+            return n0_future::Either::Left(std::future::ready(self.handle_identity_upgrade(req)));
+        }
         // Create a client if the request hits the relay endpoint.
         if matches!(
             (req.method(), req.uri().path()),
@@ -764,7 +806,7 @@ impl Service<Request<Incoming>> for RelayServiceWithNotify {
                     .body(body_full(e.to_string())),
             }
             .map_err(Into::into);
-            return std::future::ready(response);
+            return n0_future::Either::Left(std::future::ready(response));
         }
         // Otherwise handle the relay connection as normal.
 
@@ -777,7 +819,7 @@ impl Service<Request<Incoming>> for RelayServiceWithNotify {
             .get(&(req.method().clone(), uri.path()))
         {
             let response = handler(req, self.service.0.default_response());
-            return std::future::ready(response);
+            return n0_future::Either::Left(std::future::ready(response));
         }
 
         // Otherwise return 404
@@ -785,7 +827,7 @@ impl Service<Request<Incoming>> for RelayServiceWithNotify {
             .service
             .0
             .not_found_fn(req, self.service.0.default_response());
-        std::future::ready(response)
+        n0_future::Either::Left(std::future::ready(response))
     }
 }
 
@@ -910,6 +952,17 @@ pub(super) enum TlsAcceptor {
 }
 
 impl RelayService {
+    /// Enable the experimental typed identity route with its own explicit policy.
+    ///
+    /// May be called once. Legacy access control continues to govern `/relay`.
+    #[cfg(feature = "unstable-identity")]
+    pub fn enable_identity(
+        &self,
+        service: crate::identity::Service,
+    ) -> Result<(), crate::identity::Service> {
+        self.0.identity.set(service)
+    }
+
     /// Creates a new RelayService.
     ///
     /// This allows embedding the relay service into an existing HTTP server.
@@ -922,6 +975,8 @@ impl RelayService {
         metrics: Arc<Metrics>,
     ) -> Self {
         Self(Arc::new(Inner {
+            #[cfg(feature = "unstable-identity")]
+            identity: std::sync::OnceLock::new(),
             handlers,
             headers,
             clients: Clients::default(),
@@ -943,6 +998,10 @@ impl RelayService {
 
     /// Shuts down the relay service, disconnecting all clients.
     pub async fn shutdown(&self) {
+        #[cfg(feature = "unstable-identity")]
+        if let Some(identity) = self.0.identity.get() {
+            identity.shutdown();
+        }
         self.0.clients.shutdown().await;
     }
 
@@ -1024,6 +1083,11 @@ impl RelayService {
         // and passed to the relay server.
         let on_establish = Arc::new(Notify::new());
         let service = RelayServiceWithNotify::new(self, on_establish.clone());
+        #[cfg(feature = "unstable-identity")]
+        let service = match stream.peer_addr() {
+            Ok(address) => service.with_source_ip(address.ip()),
+            Err(_) => service,
+        };
 
         // This is the main connection future, driving the connection to completion.
         let serve_fut = async move {
@@ -1077,6 +1141,93 @@ impl RelayService {
 }
 
 impl RelayServiceWithNotify {
+    #[cfg(feature = "unstable-identity")]
+    fn handle_identity_upgrade(
+        &self,
+        mut req: Request<Incoming>,
+    ) -> HyperResult<Response<BytesBody>> {
+        let Some(service) = self.service.0.identity.get().cloned() else {
+            return Ok(self
+                .build_response()
+                .status(StatusCode::NOT_FOUND)
+                .body(body_full("Not Found"))?);
+        };
+        let valid = req
+            .headers()
+            .get(UPGRADE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+            && req
+                .headers()
+                .get(CONNECTION)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.split(',')
+                        .any(|v| v.trim().eq_ignore_ascii_case("upgrade"))
+                })
+            && req
+                .headers()
+                .get(SEC_WEBSOCKET_VERSION)
+                .is_some_and(|v| v == "13")
+            && req
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .is_some_and(|v| v == crate::identity::PROTOCOL);
+        let key = req.headers().get(SEC_WEBSOCKET_KEY).filter(|v| {
+            data_encoding::BASE64
+                .decode(v.as_bytes())
+                .is_ok_and(|v| v.len() == 16)
+        });
+        if !valid || key.is_none() {
+            return Ok(self
+                .build_response()
+                .status(StatusCode::BAD_REQUEST)
+                .body(body_full("invalid identity relay upgrade"))?);
+        }
+        let accept_key = derive_accept_key(key.expect("checked key"));
+        let Some(source) = service.admit(self.source_ip) else {
+            return Ok(self
+                .build_response()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(body_full("identity source limit exceeded"))?);
+        };
+        // Reserve the session before switching protocols so a full relay
+        // answers with a status code rather than an upgraded socket that closes.
+        let Some(permit) = service.reserve_session() else {
+            return Ok(self
+                .build_response()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(body_full("identity relay at capacity"))?);
+        };
+        let notify = self.on_establish.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let upgraded = hyper::upgrade::on(&mut req)
+                    .await
+                    .map_err(|error| iroh_identity::Error::Io(std::io::Error::other(error)))?;
+                // TokioIo retains Hyper's already-read bytes, including an early frame.
+                notify.notify_waiters();
+                service
+                    .accept(hyper_util::rt::TokioIo::new(upgraded), source, permit)
+                    .await
+            }
+            .await;
+            match result {
+                Ok(()) | Err(iroh_identity::Error::Closed) => {
+                    debug!("identity relay session ended");
+                }
+                Err(error) => warn!(%error, "identity relay session failed"),
+            }
+        });
+        Ok(self
+            .build_response()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header(UPGRADE, "websocket")
+            .header(CONNECTION, "upgrade")
+            .header(SEC_WEBSOCKET_ACCEPT, accept_key)
+            .header(SEC_WEBSOCKET_PROTOCOL, crate::identity::PROTOCOL)
+            .body(body_full(Bytes::new()))?)
+    }
+
     /// Serves a TLS connection.
     async fn tls_serve_connection(
         self,
@@ -1119,6 +1270,10 @@ impl RelayServiceWithNotify {
 
     /// Wrapper for the actual http connection (with upgrades)
     async fn serve_connection(self, io: MaybeTlsStream) -> Result<(), ServeConnectionError> {
+        #[cfg(feature = "unstable-identity")]
+        if self.service.0.identity.get().is_some() {
+            io.disable_nagle();
+        }
         hyper::server::conn::http1::Builder::new()
             .serve_connection(hyper_util::rt::TokioIo::new(io), self)
             .with_upgrades()
