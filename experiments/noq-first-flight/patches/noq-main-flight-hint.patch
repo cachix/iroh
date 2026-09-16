@@ -1,0 +1,279 @@
+diff --git a/noq-proto/src/connection/mod.rs b/noq-proto/src/connection/mod.rs
+index 5a89682..03ef347 100644
+--- a/noq-proto/src/connection/mod.rs
++++ b/noq-proto/src/connection/mod.rs
+@@ -156,6 +156,8 @@ use state::StateType;
+ /// call to [`handle_event`](Self::handle_event) at that same instant; however
+ /// events or timeouts with different instants must not be interleaved.
+ pub struct Connection {
++    // Selected once by the crypto backend before sending the first Initial.
++    repeat_first_initial: bool,
+     endpoint_config: Arc<EndpointConfig>,
+     config: Arc<TransportConfig>,
+     rng: StdRng,
+@@ -361,6 +363,7 @@ impl Connection {
+         )]);
+ 
+         let mut this = Self {
++            repeat_first_initial: side.is_client() && crypto.large_server_flight_expected(),
+             endpoint_config,
+             crypto_state: CryptoState::new(crypto, init_cid, side, &mut rng),
+             handshake_cid: local_cid,
+@@ -1736,6 +1739,22 @@ impl Connection {
+ 
+             self.populate_packet(now, space_id, path_id, scheduling_info, &mut builder);
+ 
++            // Repeat CRYPTO in a newly numbered Initial so either packet can start TLS.
++            // Keep both copies under normal pacing, congestion, and ACK/loss accounting.
++            if self.repeat_first_initial
++                && self.side.is_client()
++                && space_id == SpaceId::Initial
++                && builder.packet_number == 0
++                && let Some(sent) = builder.sent_frames().retransmits.get()
++            {
++                for crypto in sent.crypto.iter().rev() {
++                    self.spaces[space_id]
++                        .pending
++                        .crypto
++                        .push_front(crypto.clone());
++                }
++            }
++
+             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
+             // any other reason, there is a bug which leads to one component announcing write
+             // readiness while not writing any data. This degrades performance. The condition is
+diff --git a/noq-proto/src/crypto.rs b/noq-proto/src/crypto.rs
+index 7dc887b..b89a8e7 100644
+--- a/noq-proto/src/crypto.rs
++++ b/noq-proto/src/crypto.rs
+@@ -28,6 +28,16 @@ pub mod rustls;
+ 
+ /// A cryptographic session (commonly TLS)
+ pub trait Session: Send + Sync + 'static {
++    /// Whether a large server authentication flight is expected before address validation.
++    ///
++    /// A client may repeat its first Initial's CRYPTO to provide more amplification allowance
++    /// and tolerate loss of either copy. Normal pacing and congestion checks still apply.
++    /// This hint does not change authentication policy. Return false when the expected flight
++    /// is small or unknown. The default preserves existing backend behavior.
++    fn large_server_flight_expected(&self) -> bool {
++        false
++    }
++
+     /// Create the initial set of keys given the client's initial destination ConnectionId
+     fn initial_keys(&self, dst_cid: ConnectionId, side: Side) -> Keys;
+ 
+diff --git a/noq-proto/src/crypto/rustls.rs b/noq-proto/src/crypto/rustls.rs
+index 6e04294..b27d882 100644
+--- a/noq-proto/src/crypto/rustls.rs
++++ b/noq-proto/src/crypto/rustls.rs
+@@ -30,6 +30,7 @@ impl From<Side> for rustls::Side {
+ 
+ /// A rustls TLS session
+ pub struct TlsSession {
++    large_server_flight_expected: bool,
+     version: Version,
+     got_handshake_data: bool,
+     next_secrets: Option<Secrets>,
+@@ -47,6 +48,10 @@ impl TlsSession {
+ }
+ 
+ impl crypto::Session for TlsSession {
++    fn large_server_flight_expected(&self) -> bool {
++        self.large_server_flight_expected
++    }
++
+     fn initial_keys(&self, dst_cid: ConnectionId, side: Side) -> Keys {
+         initial_keys(self.version, dst_cid, side, &self.suite)
+     }
+@@ -292,9 +297,22 @@ pub struct HandshakeData {
+ pub struct QuicClientConfig {
+     pub(crate) inner: Arc<rustls::ClientConfig>,
+     initial: Suite,
++    large_server_flight_expected: bool,
+ }
+ 
+ impl QuicClientConfig {
++    /// Hint that the configured remote authentication policy expects a large server flight.
++    ///
++    /// Defaults to false. Enable only when the expected authentication format and remote
++    /// policy justify an additional client Initial. Mixed or unknown policies should leave
++    /// this disabled. It can increase traffic and worsen performance on constrained links.
++    /// This does not change the TLS verifier, pacing, congestion control, or amplification limit.
++    /// Callers enabling resumption must account for potentially smaller resumed flights.
++    pub fn large_server_flight_expected(&mut self, expected: bool) -> &mut Self {
++        self.large_server_flight_expected = expected;
++        self
++    }
++
+     #[cfg(all(
+         feature = "platform-verifier",
+         any(feature = "aws-lc-rs", feature = "ring")
+@@ -311,6 +329,7 @@ impl QuicClientConfig {
+ 
+         inner.enable_early_data = true;
+         Ok(Self {
++            large_server_flight_expected: false,
+             // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+             initial: initial_suite_from_provider(inner.crypto_provider())
+                 .expect("no initial cipher suite found"),
+@@ -326,6 +345,7 @@ impl QuicClientConfig {
+     pub(crate) fn new(verifier: Arc<dyn ServerCertVerifier>) -> Self {
+         let inner = Self::inner(verifier);
+         Self {
++            large_server_flight_expected: false,
+             // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+             initial: initial_suite_from_provider(inner.crypto_provider())
+                 .expect("no initial cipher suite found"),
+@@ -341,7 +361,11 @@ impl QuicClientConfig {
+         initial: Suite,
+     ) -> Result<Self, NoInitialCipherSuite> {
+         match initial.suite.common.suite {
+-            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
++            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self {
++                inner,
++                initial,
++                large_server_flight_expected: false,
++            }),
+             _ => Err(NoInitialCipherSuite { specific: true }),
+         }
+     }
+@@ -376,6 +400,7 @@ impl crypto::ClientConfig for QuicClientConfig {
+     ) -> Result<Box<dyn crypto::Session>, ConnectError> {
+         let version = interpret_version(version)?;
+         Ok(Box::new(TlsSession {
++            large_server_flight_expected: self.large_server_flight_expected,
+             version,
+             got_handshake_data: false,
+             next_secrets: None,
+@@ -408,6 +433,7 @@ impl TryFrom<Arc<rustls::ClientConfig>> for QuicClientConfig {
+ 
+     fn try_from(inner: Arc<rustls::ClientConfig>) -> Result<Self, Self::Error> {
+         Ok(Self {
++            large_server_flight_expected: false,
+             initial: initial_suite_from_provider(inner.crypto_provider())
+                 .ok_or(NoInitialCipherSuite { specific: false })?,
+             inner,
+@@ -541,6 +567,7 @@ impl crypto::ServerConfig for QuicServerConfig {
+         // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
+         let version = interpret_version(version).unwrap();
+         Box::new(TlsSession {
++            large_server_flight_expected: false,
+             version,
+             got_handshake_data: false,
+             next_secrets: None,
+diff --git a/noq-proto/src/tests/mod.rs b/noq-proto/src/tests/mod.rs
+index 50ad621..d268355 100644
+--- a/noq-proto/src/tests/mod.rs
++++ b/noq-proto/src/tests/mod.rs
+@@ -45,6 +45,7 @@ use crate::{
+     transport_parameters::TransportParameters,
+ };
+ 
++mod repeated_initial;
+ mod util;
+ pub(crate) use util::subscribe;
+ use util::{
+diff --git a/noq-proto/src/tests/repeated_initial.rs b/noq-proto/src/tests/repeated_initial.rs
+new file mode 100644
+index 0000000..7bcfa22
+--- /dev/null
++++ b/noq-proto/src/tests/repeated_initial.rs
+@@ -0,0 +1,97 @@
++//! Diagnostic repeated Initials with the unmodified pacer.
++use super::*;
++use super::util::client_crypto;
++
++fn initial_pair(repeat: bool, rate: Option<u64>) -> (Pair, ConnectionHandle) {
++    let mut pair = Pair::default();
++    let mut transport = TransportConfig::default();
++    transport.max_outgoing_bytes_per_second(rate);
++    transport.mtu_discovery_config(None);
++    let mut crypto = client_crypto();
++    if repeat {
++        crypto.large_server_flight_expected(true);
++    }
++    let mut config = ClientConfig::new(Arc::new(crypto));
++    config.transport_config(Arc::new(transport));
++    let client = pair.begin_connect(config);
++    (pair, client)
++}
++
++fn collect_initials(pair: &mut Pair, client: ConnectionHandle) {
++    let start = pair.time;
++    pair.drive_client();
++    // Repetition must not bypass the pacer to send two datagrams immediately.
++    assert_eq!(pair.server.inbound.len(), 1);
++    while pair.server.inbound.len() < 2 {
++        // Do not let the server consume either packet yet. Advance only to the
++        // client's pacing timer, not to the queued server receive time.
++        let wakeup = pair.client.next_wakeup().expect("pending repeated Initial");
++        assert!(wakeup > pair.time);
++        pair.time = wakeup;
++        pair.drive_client();
++        assert!(
++            pair.time - start < Duration::from_millis(999),
++            "reached initial PTO"
++        );
++    }
++    assert_eq!(pair.server.inbound.len(), 2);
++    assert_eq!(pair.client_conn_mut(client).stats().frame_tx.crypto, 2);
++    assert_eq!(pair.server.inbound[0].packet.len(), 1200);
++    assert_eq!(pair.server.inbound[1].packet.len(), 1200);
++    assert_ne!(pair.server.inbound[0].packet, pair.server.inbound[1].packet);
++}
++
++#[test]
++fn repeated_initial_survives_either_packet_lost() {
++    for drop_first in [true, false] {
++        let (mut pair, client) = initial_pair(true, None);
++        collect_initials(&mut pair, client);
++        if drop_first {
++            pair.server.inbound.pop_first().unwrap();
++        } else {
++            pair.server.inbound.pop_last().unwrap();
++        }
++        pair.drive_server();
++        let server = pair.server.assert_accept();
++        assert!(pair.server_conn_mut(server).stats().frame_tx.crypto > 0);
++        pair.drive();
++        pair.finish_connect(client, server);
++    }
++}
++
++#[test]
++fn repeated_initial_handles_reordering() {
++    let (mut pair, client) = initial_pair(true, None);
++    collect_initials(&mut pair, client);
++    let (_, first) = pair.server.inbound.pop_first().unwrap();
++    let (_, last) = pair.server.inbound.pop_last().unwrap();
++    pair.server.inbound.push(pair.time, last);
++    pair.server.inbound.push(pair.time, first);
++    pair.drive();
++    let server = pair.server.assert_accept();
++    pair.finish_connect(client, server);
++}
++
++#[test]
++fn repeated_initial_respects_explicit_rate_cap() {
++    let (mut pair, client) = initial_pair(true, Some(12_000));
++    let start = pair.time;
++    collect_initials(&mut pair, client);
++    // Check a conservative lower bound on the pacing delay with a rate cap.
++    // This does not assert the exact configured rate or token refill timing.
++    assert!(pair.time - start >= Duration::from_millis(80));
++    pair.drive();
++    let server = pair.server.assert_accept();
++    pair.finish_connect(client, server);
++}
++
++#[test]
++fn repeated_initial_disabled_keeps_single_initial() {
++    let (mut pair, client) = initial_pair(false, None);
++    pair.drive_client();
++    assert_eq!(pair.server.inbound.len(), 1);
++    assert_eq!(pair.client_conn_mut(client).stats().frame_tx.crypto, 1);
++    pair.drive();
++    let server = pair.server.assert_accept();
++    pair.finish_connect(client, server);
++}

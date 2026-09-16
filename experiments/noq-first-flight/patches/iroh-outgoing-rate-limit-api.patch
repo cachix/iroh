@@ -1,0 +1,20 @@
+diff --git a/iroh/src/endpoint/quic.rs b/iroh/src/endpoint/quic.rs
+index 9f4da2177f..97964a6d87 100644
+--- a/iroh/src/endpoint/quic.rs
++++ b/iroh/src/endpoint/quic.rs
+@@ -283,6 +283,15 @@ impl QuicTransportConfigBuilder {
+         self
+     }
+ 
++    /// Limits outgoing bytes per second for each connection.
++    ///
++    /// Defaults to `None`, which disables the limit. This is a per-connection
++    /// pacing limit, not an aggregate limit across connections or endpoints.
++    pub fn max_outgoing_bytes_per_second(mut self, value: Option<u64>) -> Self {
++        self.0.max_outgoing_bytes_per_second(value);
++        self
++    }
++
+     /// The initial value to be used as the maximum UDP payload size before running MTU discovery
+     /// (see [`QuicTransportConfigBuilder::mtu_discovery_config`]).
+     ///

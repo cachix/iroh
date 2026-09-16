@@ -1,0 +1,191 @@
+diff --git a/experiments/noq-first-flight/harness/src/main.rs b/experiments/noq-first-flight/harness/src/main.rs
+index c22302f93d..ef0c37359a 100644
+--- a/experiments/noq-first-flight/harness/src/main.rs
++++ b/experiments/noq-first-flight/harness/src/main.rs
+@@ -47,8 +47,17 @@ async fn network(samples: usize) {
+     let mut bulk_tasks = Vec::new();
+     if std::env::var_os("BENCH_COMPETE").is_some() {
+         for _ in 0..2 {
++            let mut transport = QuicTransportConfig::builder();
++            if let Ok(value) = std::env::var("BENCH_BULK_MAX_OUTGOING_BPS") {
++                let cap = value.parse::<u64>().unwrap();
++                transport = transport.max_outgoing_bytes_per_second((cap != 0).then_some(cap));
++            }
++            if std::env::var_os("BENCH_DISABLE_GSO").is_some() {
++                transport = transport.enable_segmentation_offload(false);
++            }
+             bulk_endpoints.push(IdentityEndpoint::builder(identity(false, &registry), registry.clone())
+                 .bind_addr("127.0.0.1:0".parse().unwrap())
++                .transport_config(transport.build())
+                 .alpns(vec![ALPN.to_vec()]).bind().await.unwrap());
+         }
+         let (outgoing, incoming) = tokio::join!(
+@@ -75,28 +84,57 @@ async fn network(samples: usize) {
+     }
+     let mut pairs = Vec::new();
+     for pq in [false,true] {
++        let registry = if std::env::var("BENCH_REMOTE_POLICY").as_deref() == Ok("single") {
++            Arc::new(Registry::builtins(vec![if pq { 2 } else { 1 }]).unwrap())
++        } else {
++            registry.clone()
++        };
+         let mut endpoints = Vec::new();
+         for role in 0..2 {
+             let role_pq = pq && match std::env::var("BENCH_MIXED").as_deref() { Ok("client_pq") => role == 0, Ok("server_pq") => role == 1, _ => true };
++            let mut transport = QuicTransportConfig::builder()
++                .max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()));
++            if std::env::var_os("BENCH_DISABLE_GSO").is_some() {
++                transport = transport.enable_segmentation_offload(false);
++            }
++            if let Ok(value) = std::env::var("BENCH_INITIAL_RTT_MS") {
++                transport = transport.initial_rtt(Duration::from_millis(value.parse().unwrap()));
++            }
++            if let Ok(value) = std::env::var("BENCH_MAX_OUTGOING_BPS") {
++                let cap = value.parse::<u64>().unwrap();
++                transport = transport.max_outgoing_bytes_per_second((cap != 0).then_some(cap));
++            }
+             endpoints.push(IdentityEndpoint::builder(identity(role_pq, &registry), registry.clone())
+                 .bind_addr("127.0.0.1:0".parse().unwrap())
+                 .alpns(vec![ALPN.to_vec()])
+-                .transport_config(QuicTransportConfig::builder()
+-                    .max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap())).build())
++                .transport_config(transport.build())
+                 .bind().await.unwrap());
+         }
+         pairs.push(endpoints);
+     }
+     println!("suite,sample,handshake_us,client_tx_bytes,server_tx_bytes,status");
+     let warmups = if samples == 0 || std::env::var_os("TRACE_BENCH").is_some() { 0 } else { 5 };
++    let pq_only = std::env::var_os("BENCH_PQ_ONLY").is_some();
++    let fixed_interval = std::env::var("BENCH_FIXED_INTERVAL_MS").ok()
++        .map(|value| Duration::from_millis(value.parse().unwrap()));
++    if let Some(interval) = fixed_interval {
++        assert!(pq_only && !interval.is_zero(), "fixed arrivals require PQ-only and a positive interval");
++    }
++    let fixed_origin = Instant::now();
+     let mut measured_start = Instant::now();
+     let mut measured_bytes = bulk_bytes.load(std::sync::atomic::Ordering::Relaxed);
+     for sample in 0..samples+warmups {
++        let slot = fixed_interval.map(|interval| fixed_origin + interval * u32::try_from(sample).unwrap());
++        if let Some(slot) = slot {
++            tokio::time::sleep_until(tokio::time::Instant::from_std(slot)).await;
++            eprintln!("SCHEDULE sample={sample} measured={} late_us={}", sample >= warmups, slot.elapsed().as_micros());
++        }
+         if sample == warmups {
+             measured_start = Instant::now();
+             measured_bytes = bulk_bytes.load(std::sync::atomic::Ordering::Relaxed);
+         }
+         for pq in if sample % 2 == 0 { [false,true] } else { [true,false] } {
++            if pq_only && !pq { continue; }
+             let client = &pairs[pq as usize][0];
+             let server = &pairs[pq as usize][1];
+             if std::env::var_os("TRACE_BENCH").is_some() { eprintln!("BENCH_START suite={} client={} server={}", suite(pq), client.local_addr().unwrap(), server.local_addr().unwrap()); }
+@@ -140,6 +178,10 @@ async fn network(samples: usize) {
+             }
+             // Let close packets clear the emulated path before the next sample.
+             tokio::time::sleep(Duration::from_millis(120)).await;
++            if let (Some(slot), Some(interval)) = (slot, fixed_interval) {
++                assert!(Instant::now() <= slot + interval, "fixed arrival interval overrun");
++                tokio::time::sleep_until(tokio::time::Instant::from_std(slot + interval)).await;
++            }
+             if let Ok(interval) = std::env::var("BENCH_INTERVAL_MS") {
+                 tokio::time::sleep_until(tokio::time::Instant::from_std(start + Duration::from_millis(interval.parse().unwrap()))).await;
+             }
+@@ -148,7 +190,7 @@ async fn network(samples: usize) {
+     if samples == 0 { tokio::time::sleep(Duration::from_secs(20)).await; }
+     let elapsed = measured_start.elapsed().as_secs_f64();
+     let received = bulk_bytes.load(std::sync::atomic::Ordering::Relaxed) - measured_bytes;
+-    eprintln!("BULK_RESULT seconds={elapsed:.6} bytes={received} mbps={:.6} handshakes_per_second={:.6}", received as f64 * 8.0 / elapsed / 1e6, samples as f64 * 2.0 / elapsed);
++    eprintln!("BULK_RESULT seconds={elapsed:.6} bytes={received} mbps={:.6} handshakes_per_second={:.6}", received as f64 * 8.0 / elapsed / 1e6, samples as f64 * if pq_only { 1.0 } else { 2.0 } / elapsed);
+     for task in &bulk_tasks { assert!(!task.is_finished(), "bulk transfer stopped early"); }
+     for task in bulk_tasks { task.abort(); let _ = task.await; }
+     for endpoint in &bulk_endpoints { endpoint.close().await; }
+diff --git a/iroh/Cargo.toml b/iroh/Cargo.toml
+index 2cf32d4b3f..bb8f4b49cd 100644
+--- a/iroh/Cargo.toml
++++ b/iroh/Cargo.toml
+@@ -169,6 +169,8 @@ unstable-custom-transports = []
+ unstable-net-report = []
+ # Unstable: pluggable identity authentication on direct IP connections.
+ unstable-identity = ["tls-aws-lc-rs", "dep:iroh-identity", "iroh-relay/unstable-identity"]
++# Experimental automatic Initial repetition for an exclusively ML-DSA-65 remote policy.
++unstable-identity-flight-hint = ["unstable-identity"]
+ 
+ [package.metadata.docs.rs]
+ all-features = true
+diff --git a/iroh/src/endpoint/quic.rs b/iroh/src/endpoint/quic.rs
+index 9f4da2177f..97964a6d87 100644
+--- a/iroh/src/endpoint/quic.rs
++++ b/iroh/src/endpoint/quic.rs
+@@ -283,6 +283,15 @@ impl QuicTransportConfigBuilder {
+         self
+     }
+ 
++    /// Limits outgoing bytes per second for each connection.
++    ///
++    /// Defaults to `None`, which disables the limit. This is a per-connection
++    /// pacing limit, not an aggregate limit across connections or endpoints.
++    pub fn max_outgoing_bytes_per_second(mut self, value: Option<u64>) -> Self {
++        self.0.max_outgoing_bytes_per_second(value);
++        self
++    }
++
+     /// The initial value to be used as the maximum UDP payload size before running MTU discovery
+     /// (see [`QuicTransportConfigBuilder::mtu_discovery_config`]).
+     ///
+diff --git a/iroh/src/identity/tls.rs b/iroh/src/identity/tls.rs
+index 93b128901c..31ab58362c 100644
+--- a/iroh/src/identity/tls.rs
++++ b/iroh/src/identity/tls.rs
+@@ -41,6 +41,7 @@ pub(super) fn client(
+     provider: Arc<rustls::crypto::CryptoProvider>,
+     keylog: bool,
+ ) -> Result<noq::ClientConfig, Error> {
++    let large_flight = large_server_flight_expected(&registry.schemes());
+     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+         .with_protocol_versions(&[&rustls::version::TLS13])?
+         .dangerous()
+@@ -56,10 +57,19 @@ pub(super) fn client(
+     tls.enable_sni = false;
+     tls.enable_early_data = false;
+     tls.resumption = rustls::client::Resumption::disabled();
+-    let crypto = noq::crypto::rustls::QuicClientConfig::try_from(tls)?;
++    let mut crypto = noq::crypto::rustls::QuicClientConfig::try_from(tls)?;
++    if cfg!(feature = "unstable-identity-flight-hint") {
++        crypto.large_server_flight_expected(large_flight);
++    }
+     Ok(noq::ClientConfig::new(Arc::new(crypto)))
+ }
+ 
++// This endpoint uses raw public keys and disables resumption. Only the known,
++// exclusively ML-DSA-65 remote policy selects the large-flight hint.
++fn large_server_flight_expected(schemes: &[SignatureScheme]) -> bool {
++    matches!(schemes, [SignatureScheme::ML_DSA_65])
++}
++
+ #[derive(Debug)]
+ struct Resolver(Arc<rustls::sign::CertifiedKey>);
+ 
+@@ -222,3 +232,22 @@ impl ClientCertVerifier for Verifier {
+         true
+     }
+ }
++
++#[cfg(test)]
++mod flight_hint_tests {
++    use super::*;
++
++    #[test]
++    fn selects_only_exclusive_ml_dsa65_policy() {
++        assert!(large_server_flight_expected(&[SignatureScheme::ML_DSA_65]));
++        for schemes in [
++            vec![],
++            vec![SignatureScheme::ED25519],
++            vec![SignatureScheme::ED25519, SignatureScheme::ML_DSA_65],
++            vec![SignatureScheme::Unknown(0xfeff)],
++            vec![SignatureScheme::ML_DSA_65, SignatureScheme::Unknown(0xfeff)],
++        ] {
++            assert!(!large_server_flight_expected(&schemes), "{schemes:?}");
++        }
++    }
++}
